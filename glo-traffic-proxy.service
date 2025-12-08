@@ -1,0 +1,35 @@
+[Unit]
+Description=GLO Traffic Callback Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=glo-traffic
+Group=glo-traffic
+WorkingDirectory=/opt/glo-traffic-proxy
+ExecStart=/opt/glo-traffic-proxy/glo-traffic-proxy
+Restart=always
+RestartSec=5
+
+# Environment variables
+EnvironmentFile=/opt/glo-traffic-proxy/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=glo-traffic-proxy
+
+[Install]
+WantedBy=multi-user.target
