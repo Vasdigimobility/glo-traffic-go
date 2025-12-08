@@ -172,6 +172,30 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (cp *CallbackProxy) ClearQueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	cleared := 0
+	for {
+		select {
+		case <-cp.queue:
+			cleared++
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":  "cleared",
+				"cleared": cleared,
+			})
+			log.Printf("Queue cleared: %d requests dropped", cleared)
+			return
+		}
+	}
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -227,6 +251,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", proxy.HealthCheck)
+	mux.HandleFunc("/clear-queue", proxy.ClearQueue)
 	mux.HandleFunc("/", proxy.HandleCallback)
 
 	server := &http.Server{
