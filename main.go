@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -26,11 +27,44 @@ type Config struct {
 }
 
 type ForwardRequest struct {
-	Method  string
-	Path    string
-	Headers http.Header
-	Body    []byte
-	Query   string
+	Method     string
+	Path       string
+	Headers    http.Header
+	Body       []byte
+	Query      string
+	ReceivedAt time.Time
+}
+
+type Metrics struct {
+	TotalReceived  int64
+	TotalForwarded int64
+	TotalFailed    int64
+	TotalDropped   int64
+	LastForwardMs  int64
+	AvgForwardMs   int64
+	MaxForwardMs   int64
+	MinForwardMs   int64
+	forwardCount   int64
+	forwardSumMs   int64
+	mu             sync.RWMutex
+}
+
+func (m *Metrics) RecordForward(duration time.Duration) {
+	ms := duration.Milliseconds()
+	atomic.AddInt64(&m.TotalForwarded, 1)
+	atomic.StoreInt64(&m.LastForwardMs, ms)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forwardCount++
+	m.forwardSumMs += ms
+	m.AvgForwardMs = m.forwardSumMs / m.forwardCount
+	if ms > m.MaxForwardMs {
+		m.MaxForwardMs = ms
+	}
+	if m.MinForwardMs == 0 || ms < m.MinForwardMs {
+		m.MinForwardMs = ms
+	}
 }
 
 type CallbackProxy struct {
@@ -39,6 +73,7 @@ type CallbackProxy struct {
 	queue      chan ForwardRequest
 	wg         sync.WaitGroup
 	shutdownCh chan struct{}
+	metrics    *Metrics
 }
 
 func NewCallbackProxy(config Config) *CallbackProxy {
@@ -49,6 +84,7 @@ func NewCallbackProxy(config Config) *CallbackProxy {
 		},
 		queue:      make(chan ForwardRequest, config.QueueSize),
 		shutdownCh: make(chan struct{}),
+		metrics:    &Metrics{},
 	}
 }
 
@@ -87,14 +123,20 @@ func (cp *CallbackProxy) forwardWithRetry(fwdReq ForwardRequest) {
 			log.Printf("Retry attempt %d for %s %s", attempt, fwdReq.Method, fwdReq.Path)
 		}
 
+		start := time.Now()
 		err := cp.forward(fwdReq)
+		forwardDuration := time.Since(start)
+		queueWait := start.Sub(fwdReq.ReceivedAt)
 		if err == nil {
-			log.Printf("Successfully forwarded: %s %s", fwdReq.Method, fwdReq.Path)
+			cp.metrics.RecordForward(forwardDuration)
+			log.Printf("Successfully forwarded: %s %s (queue_wait: %dms, forward: %dms)",
+				fwdReq.Method, fwdReq.Path, queueWait.Milliseconds(), forwardDuration.Milliseconds())
 			return
 		}
 		lastErr = err
 	}
 
+	atomic.AddInt64(&cp.metrics.TotalFailed, 1)
 	log.Printf("Failed to forward after %d retries: %s %s - Error: %v",
 		cp.config.MaxRetries, fwdReq.Method, fwdReq.Path, lastErr)
 }
@@ -134,6 +176,7 @@ func (cp *CallbackProxy) forward(fwdReq ForwardRequest) error {
 }
 
 func (cp *CallbackProxy) HandleCallback(w http.ResponseWriter, r *http.Request) {
+	requestStart := time.Now()
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("Error reading request body: %v", err)
@@ -142,18 +185,23 @@ func (cp *CallbackProxy) HandleCallback(w http.ResponseWriter, r *http.Request) 
 	}
 	defer r.Body.Close()
 
+	receivedAt := time.Now()
 	fwdReq := ForwardRequest{
-		Method:  r.Method,
-		Path:    r.URL.Path,
-		Headers: r.Header.Clone(),
-		Body:    body,
-		Query:   r.URL.RawQuery,
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		Headers:    r.Header.Clone(),
+		Body:       body,
+		Query:      r.URL.RawQuery,
+		ReceivedAt: receivedAt,
 	}
 
 	select {
 	case cp.queue <- fwdReq:
-		log.Printf("Queued request: %s %s (queue size: %d) payload: %s", r.Method, r.URL.Path, len(cp.queue), string(body))
+		atomic.AddInt64(&cp.metrics.TotalReceived, 1)
+		responseTime := time.Since(requestStart)
+		log.Printf("Queued request: %s %s (queue size: %d, response_time: %dµs) payload: %s", r.Method, r.URL.Path, len(cp.queue), responseTime.Microseconds(), string(body))
 	default:
+		atomic.AddInt64(&cp.metrics.TotalDropped, 1)
 		log.Printf("Queue full, dropping request: %s %s", r.Method, r.URL.Path)
 		http.Error(w, "Server busy", http.StatusServiceUnavailable)
 		return
@@ -163,12 +211,25 @@ func (cp *CallbackProxy) HandleCallback(w http.ResponseWriter, r *http.Request) 
 }
 
 func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
+	cp.metrics.mu.RLock()
+	defer cp.metrics.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":     "healthy",
 		"queue_size": len(cp.queue),
 		"queue_cap":  cap(cp.queue),
+		"metrics": map[string]interface{}{
+			"total_received":  atomic.LoadInt64(&cp.metrics.TotalReceived),
+			"total_forwarded": atomic.LoadInt64(&cp.metrics.TotalForwarded),
+			"total_failed":    atomic.LoadInt64(&cp.metrics.TotalFailed),
+			"total_dropped":   atomic.LoadInt64(&cp.metrics.TotalDropped),
+			"last_forward_ms": atomic.LoadInt64(&cp.metrics.LastForwardMs),
+			"avg_forward_ms":  cp.metrics.AvgForwardMs,
+			"max_forward_ms":  cp.metrics.MaxForwardMs,
+			"min_forward_ms":  cp.metrics.MinForwardMs,
+		},
 	})
 }
 
