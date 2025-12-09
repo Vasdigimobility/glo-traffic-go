@@ -152,7 +152,7 @@ func (cp *CallbackProxy) HandleCallback(w http.ResponseWriter, r *http.Request) 
 
 	select {
 	case cp.queue <- fwdReq:
-		log.Printf("Queued request: %s %s (queue size: %d)", r.Method, r.URL.Path, len(cp.queue))
+		log.Printf("Queued request: %s %s (queue size: %d) payload: %s", r.Method, r.URL.Path, len(cp.queue), string(body))
 	default:
 		log.Printf("Queue full, dropping request: %s %s", r.Method, r.URL.Path)
 		http.Error(w, "Server busy", http.StatusServiceUnavailable)
