@@ -1248,6 +1248,8 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 
 	queueSize := len(cp.queue)
 	queueCap := cap(cp.queue)
+	retryQueueSize := len(cp.retryQueue)
+	retryQueueCap := cap(cp.retryQueue)
 	uptime := time.Since(cp.metrics.StartTime)
 	queueUtilization := float64(queueSize) / float64(queueCap)
 	if queueCap == 0 {
@@ -1295,15 +1297,10 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		queueUsage = "NaN%"
 	}
 
-	overallStatus := "healthy"
-	if successRate < 95.0 || queueUtilization >= 0.95 {
-		overallStatus = "unhealthy"
-	} else if successRate < 99.0 || queueUtilization >= 0.8 {
-		overallStatus = "degraded"
-	}
+	overallStatus := cp.metrics.GetHealthStatus(queueSize, queueCap)
 
 	w.Header().Set("Content-Type", "application/json")
-	if overallStatus == "unhealthy" {
+	if overallStatus == "fail" {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	} else {
 		w.WriteHeader(http.StatusOK)
@@ -1350,7 +1347,7 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 			"ttl":              "48h0m0s",
 		},
 		"queue": map[string]interface{}{
-			"retry_queue": "0/0",
+			"retry_queue": fmt.Sprintf("%d/%d", retryQueueSize, retryQueueCap),
 			"total":       fmt.Sprintf("%d/%d (%s)", queueSize, queueCap, queueUsage),
 		},
 		"started_at": cp.metrics.StartTime.Format(time.RFC3339),
