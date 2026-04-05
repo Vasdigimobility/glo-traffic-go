@@ -986,8 +986,12 @@ func (cp *CallbackProxy) processRequest(fwdReq ForwardRequest, isRetry bool) {
 	if err == nil {
 		cp.metrics.RecordForward(forwardDuration)
 		cp.metrics.RecordQueueWait(queueWait)
-		log.Printf("Successfully forwarded: %s %s (queue_wait: %dms, forward: %dms, retry_count: %d)",
-			fwdReq.Method, fwdReq.Path, queueWait.Milliseconds(), forwardDuration.Milliseconds(), fwdReq.RetryCount)
+
+		// Log full payload for reconciliation
+		payload := string(fwdReq.Body)
+
+		log.Printf("Successfully forwarded: %s %s (queue_wait: %dms, forward: %dms, retry_count: %d) payload: %s",
+			fwdReq.Method, fwdReq.Path, queueWait.Milliseconds(), forwardDuration.Milliseconds(), fwdReq.RetryCount, payload)
 		return
 	}
 
@@ -1203,8 +1207,12 @@ func (cp *CallbackProxy) HandleCallback(w http.ResponseWriter, r *http.Request) 
 	case cp.queue <- fwdReq:
 		atomic.AddInt64(&cp.metrics.TotalReceived, 1)
 		responseTime := time.Since(requestStart)
-		log.Printf("Queued request: %s %s (queue size: %d, response_time: %dµs, body_size: %d bytes)",
-			r.Method, r.URL.Path, len(cp.queue), responseTime.Microseconds(), len(body))
+
+		// Log full payload for reconciliation
+		payload := string(body)
+
+		log.Printf("Queued request: %s %s (queue size: %d, response_time: %dµs) payload: %s",
+			r.Method, r.URL.Path, len(cp.queue), responseTime.Microseconds(), payload)
 	default:
 		atomic.AddInt64(&cp.metrics.TotalDropped, 1)
 		log.Printf("Queue full, dropping request: %s %s", r.Method, r.URL.Path)
