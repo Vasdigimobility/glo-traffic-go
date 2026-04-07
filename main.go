@@ -21,6 +21,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type Config struct {
@@ -39,6 +41,10 @@ type Config struct {
 	DedupeWindow            time.Duration
 	EnablePersistence       bool
 	PersistencePath         string
+	RedisAddr               string
+	RedisPassword           string
+	RedisDB                 int
+	RedisKeyPrefix          string
 	EnableDLQ               bool
 	DLQPath                 string
 	DLQMaxSize              int
@@ -328,6 +334,120 @@ func (qp *QueuePersistence) Clear() error {
 	defer qp.mu.Unlock()
 
 	return os.Remove(qp.path)
+}
+
+type RedisPersistence struct {
+	client    *redis.Client
+	enabled   bool
+	keyPrefix string
+	mu        sync.Mutex
+	ctx       context.Context
+}
+
+func NewRedisPersistence(addr, password string, db int, keyPrefix string, enabled bool) *RedisPersistence {
+	if !enabled || addr == "" {
+		log.Printf("Redis persistence disabled")
+		return &RedisPersistence{
+			enabled: false,
+			ctx:     context.Background(),
+		}
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
+	})
+
+	ctx := context.Background()
+	if err := client.Ping(ctx).Err(); err != nil {
+		log.Printf("WARNING: Redis connection failed - %v. Persistence disabled.", err)
+		return &RedisPersistence{
+			enabled: false,
+			ctx:     ctx,
+		}
+	}
+
+	log.Printf("Redis persistence enabled at %s (DB: %d, prefix: %s)", addr, db, keyPrefix)
+	return &RedisPersistence{
+		client:    client,
+		enabled:   true,
+		keyPrefix: keyPrefix,
+		ctx:       ctx,
+	}
+}
+
+func (rp *RedisPersistence) Save(requests []ForwardRequest) error {
+	if !rp.enabled || rp.client == nil {
+		return nil
+	}
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
+	data, err := json.Marshal(requests)
+	if err != nil {
+		return fmt.Errorf("failed to marshal queue: %w", err)
+	}
+
+	key := rp.keyPrefix + ":queue"
+	err = rp.client.Set(rp.ctx, key, data, 0).Err()
+	if err != nil {
+		return fmt.Errorf("failed to save queue to Redis: %w", err)
+	}
+
+	return nil
+}
+
+func (rp *RedisPersistence) Load() ([]ForwardRequest, error) {
+	if !rp.enabled || rp.client == nil {
+		return nil, nil
+	}
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
+	key := rp.keyPrefix + ":queue"
+	data, err := rp.client.Get(rp.ctx, key).Bytes()
+	if err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to read queue from Redis: %w", err)
+	}
+
+	var requests []ForwardRequest
+	err = json.Unmarshal(data, &requests)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal queue: %w", err)
+	}
+
+	return requests, nil
+}
+
+func (rp *RedisPersistence) Clear() error {
+	if !rp.enabled || rp.client == nil {
+		return nil
+	}
+
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
+	key := rp.keyPrefix + ":queue"
+	return rp.client.Del(rp.ctx, key).Err()
+}
+
+func (rp *RedisPersistence) Close() error {
+	if rp.client != nil {
+		return rp.client.Close()
+	}
+	return nil
+}
+
+type Persistence interface {
+	Save(requests []ForwardRequest) error
+	Load() ([]ForwardRequest, error)
+	Clear() error
 }
 
 type DLQEntry struct {
@@ -777,7 +897,7 @@ type CallbackProxy struct {
 	metrics        *Metrics
 	dedupeCache    *DedupeCache
 	circuitBreaker *CircuitBreaker
-	persistence    *QueuePersistence
+	persistence    Persistence
 	dlq            *DeadLetterQueue
 }
 
@@ -794,7 +914,12 @@ func NewCallbackProxy(config Config) *CallbackProxy {
 		circuitBreaker = NewCircuitBreaker(config.CircuitBreakerThreshold, config.CircuitBreakerTimeout)
 	}
 
-	persistence := NewQueuePersistence(config.PersistencePath, config.EnablePersistence)
+	var persistence Persistence
+	if config.RedisAddr != "" {
+		persistence = NewRedisPersistence(config.RedisAddr, config.RedisPassword, config.RedisDB, config.RedisKeyPrefix, config.EnablePersistence)
+	} else {
+		persistence = NewQueuePersistence(config.PersistencePath, config.EnablePersistence)
+	}
 	dlq := NewDeadLetterQueue(config.DLQPath, config.EnableDLQ, config.DLQMaxSize)
 
 	retryQueueSize := config.RetryQueueSize
@@ -992,6 +1117,13 @@ func (cp *CallbackProxy) Stop() {
 	close(cp.queue)
 	close(cp.retryQueue)
 	cp.wg.Wait()
+
+	if rp, ok := cp.persistence.(*RedisPersistence); ok {
+		if err := rp.Close(); err != nil {
+			log.Printf("Error closing Redis connection: %v", err)
+		}
+	}
+
 	log.Println("All workers stopped")
 }
 
@@ -1401,7 +1533,7 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 			"current_depth":    persistenceWrites,
 			"expired_this_run": 0,
 			"gauge_in_memory":  persistenceWrites,
-			"redis_status":     "not_configured",
+			"redis_status":     cp.getRedisStatus(),
 			"total_expired":    0,
 			"ttl":              "48h0m0s",
 		},
@@ -1582,13 +1714,21 @@ func (cp *CallbackProxy) HealthDetailed(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if cp.config.EnablePersistence {
-		response["persistence"] = map[string]interface{}{
+		persistenceInfo := map[string]interface{}{
 			"enabled": true,
-			"path":    cp.config.PersistencePath,
 			"writes":  atomic.LoadInt64(&cp.metrics.PersistenceWrites),
 			"reads":   atomic.LoadInt64(&cp.metrics.PersistenceReads),
 			"errors":  atomic.LoadInt64(&cp.metrics.PersistenceErrors),
 		}
+		if cp.config.RedisAddr != "" {
+			persistenceInfo["type"] = "redis"
+			persistenceInfo["redis_addr"] = cp.config.RedisAddr
+			persistenceInfo["redis_db"] = cp.config.RedisDB
+		} else {
+			persistenceInfo["type"] = "file"
+			persistenceInfo["path"] = cp.config.PersistencePath
+		}
+		response["persistence"] = persistenceInfo
 	}
 
 	if cp.config.MemoryAlertThreshold > 0 {
@@ -1888,6 +2028,21 @@ func getEnvBool(key string, defaultValue bool) bool {
 	return defaultValue
 }
 
+func (cp *CallbackProxy) getRedisStatus() string {
+	if cp.config.RedisAddr == "" {
+		return "not_configured"
+	}
+	if rp, ok := cp.persistence.(*RedisPersistence); ok {
+		if rp.enabled && rp.client != nil {
+			if err := rp.client.Ping(rp.ctx).Err(); err == nil {
+				return "connected"
+			}
+			return "disconnected"
+		}
+	}
+	return "disabled"
+}
+
 func main() {
 	config := Config{
 		ListenAddr:              getEnv("LISTEN_ADDR", ":8080"),
@@ -1903,8 +2058,12 @@ func main() {
 		RequestTTL:              getEnvDuration("REQUEST_TTL", 5*time.Minute),
 		EnableDedupe:            getEnvBool("ENABLE_DEDUPE", true),
 		DedupeWindow:            getEnvDuration("DEDUPE_WINDOW", 5*time.Minute),
-		EnablePersistence:       getEnvBool("ENABLE_PERSISTENCE", false),
+		EnablePersistence:       getEnvBool("ENABLE_PERSISTENCE", true),
 		PersistencePath:         getEnv("PERSISTENCE_PATH", "/tmp/glo-traffic-queue.json"),
+		RedisAddr:               getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:           getEnv("REDIS_PASSWORD", ""),
+		RedisDB:                 getEnvInt("REDIS_DB", 0),
+		RedisKeyPrefix:          getEnv("REDIS_KEY_PREFIX", "glo-traffic"),
 		EnableDLQ:               getEnvBool("ENABLE_DLQ", true),
 		DLQPath:                 getEnv("DLQ_PATH", "/tmp/glo-traffic-dlq.json"),
 		DLQMaxSize:              getEnvInt("DLQ_MAX_SIZE", 10000),
@@ -1931,7 +2090,11 @@ func main() {
 	log.Printf("  Request TTL: %s", config.RequestTTL)
 	log.Printf("  Max Body Size: %d MB", config.MaxBodySize/1024/1024)
 	log.Printf("  Deduplication: %v (window: %s)", config.EnableDedupe, config.DedupeWindow)
-	log.Printf("  Persistence: %v (path: %s)", config.EnablePersistence, config.PersistencePath)
+	if config.RedisAddr != "" {
+		log.Printf("  Persistence: %v (type: Redis, addr: %s, db: %d, prefix: %s)", config.EnablePersistence, config.RedisAddr, config.RedisDB, config.RedisKeyPrefix)
+	} else {
+		log.Printf("  Persistence: %v (type: File, path: %s)", config.EnablePersistence, config.PersistencePath)
+	}
 	log.Printf("  DLQ: %v (path: %s, max size: %d)", config.EnableDLQ, config.DLQPath, config.DLQMaxSize)
 	log.Printf("  Circuit Breaker: %v (threshold: %d, timeout: %s)", config.CircuitBreakerEnabled, config.CircuitBreakerThreshold, config.CircuitBreakerTimeout)
 	log.Printf("  Memory Alert Threshold: %d MB", config.MemoryAlertThreshold/1024/1024)
