@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -211,20 +212,51 @@ func (cb *CircuitBreaker) GetFailureCount() int64 {
 }
 
 type QueuePersistence struct {
-	path    string
-	enabled bool
-	mu      sync.Mutex
+	path          string
+	enabled       bool
+	mu            sync.Mutex
+	disabled      bool
+	lastErrorTime time.Time
+	errorCount    int
 }
 
 func NewQueuePersistence(path string, enabled bool) *QueuePersistence {
-	return &QueuePersistence{
+	qp := &QueuePersistence{
 		path:    path,
 		enabled: enabled,
 	}
+
+	if enabled {
+		if err := qp.validatePath(); err != nil {
+			log.Printf("WARNING: Queue persistence disabled - %v", err)
+			qp.disabled = true
+		}
+	}
+
+	return qp
+}
+
+func (qp *QueuePersistence) validatePath() error {
+	dir := filepath.Dir(qp.path)
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("cannot create directory %s: %w", dir, err)
+	}
+
+	testFile := filepath.Join(dir, ".write_test")
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		if os.IsPermission(err) || strings.Contains(err.Error(), "read-only file system") {
+			return fmt.Errorf("path %s is not writable (read-only file system or permission denied)", dir)
+		}
+		return fmt.Errorf("cannot write to %s: %w", dir, err)
+	}
+	os.Remove(testFile)
+
+	return nil
 }
 
 func (qp *QueuePersistence) Save(requests []ForwardRequest) error {
-	if !qp.enabled {
+	if !qp.enabled || qp.disabled {
 		return nil
 	}
 
@@ -238,14 +270,32 @@ func (qp *QueuePersistence) Save(requests []ForwardRequest) error {
 
 	err = os.WriteFile(qp.path, data, 0600)
 	if err != nil {
+		if os.IsPermission(err) || strings.Contains(err.Error(), "read-only file system") {
+			if !qp.disabled {
+				log.Printf("WARNING: Disabling queue persistence - path %s is not writable: %v", qp.path, err)
+				qp.disabled = true
+			}
+			return nil
+		}
+
+		qp.errorCount++
+		qp.lastErrorTime = time.Now()
+
+		if qp.errorCount >= 10 {
+			log.Printf("WARNING: Disabling queue persistence after %d consecutive errors. Last error: %v", qp.errorCount, err)
+			qp.disabled = true
+			return nil
+		}
+
 		return fmt.Errorf("failed to write queue to disk: %w", err)
 	}
 
+	qp.errorCount = 0
 	return nil
 }
 
 func (qp *QueuePersistence) Load() ([]ForwardRequest, error) {
-	if !qp.enabled {
+	if !qp.enabled || qp.disabled {
 		return nil, nil
 	}
 
@@ -270,7 +320,7 @@ func (qp *QueuePersistence) Load() ([]ForwardRequest, error) {
 }
 
 func (qp *QueuePersistence) Clear() error {
-	if !qp.enabled {
+	if !qp.enabled || qp.disabled {
 		return nil
 	}
 
