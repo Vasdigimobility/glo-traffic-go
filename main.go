@@ -458,6 +458,14 @@ type DLQEntry struct {
 	AttemptCount  int            `json:"attempt_count"`
 }
 
+type DLQ interface {
+	Add(entry DLQEntry) error
+	GetAll() ([]DLQEntry, error)
+	GetCount() (int, error)
+	Clear() error
+	Replay(limit int) ([]ForwardRequest, error)
+}
+
 type DeadLetterQueue struct {
 	path    string
 	enabled bool
@@ -585,6 +593,151 @@ func (dlq *DeadLetterQueue) saveEntries(entries []DLQEntry) error {
 	}
 
 	return os.WriteFile(dlq.path, data, 0600)
+}
+
+type RedisDLQ struct {
+	client    *redis.Client
+	enabled   bool
+	maxSize   int
+	keyPrefix string
+	mu        sync.Mutex
+	ctx       context.Context
+}
+
+func NewRedisDLQ(client *redis.Client, keyPrefix string, enabled bool, maxSize int) *RedisDLQ {
+	if !enabled || client == nil {
+		return &RedisDLQ{
+			enabled: false,
+			ctx:     context.Background(),
+		}
+	}
+
+	return &RedisDLQ{
+		client:    client,
+		enabled:   true,
+		maxSize:   maxSize,
+		keyPrefix: keyPrefix,
+		ctx:       context.Background(),
+	}
+}
+
+func (rdlq *RedisDLQ) Add(entry DLQEntry) error {
+	if !rdlq.enabled || rdlq.client == nil {
+		return nil
+	}
+
+	rdlq.mu.Lock()
+	defer rdlq.mu.Unlock()
+
+	entries, err := rdlq.loadEntries()
+	if err != nil {
+		return fmt.Errorf("failed to load DLQ: %w", err)
+	}
+
+	entries = append(entries, entry)
+
+	if rdlq.maxSize > 0 && len(entries) > rdlq.maxSize {
+		entries = entries[len(entries)-rdlq.maxSize:]
+	}
+
+	return rdlq.saveEntries(entries)
+}
+
+func (rdlq *RedisDLQ) GetAll() ([]DLQEntry, error) {
+	if !rdlq.enabled || rdlq.client == nil {
+		return nil, nil
+	}
+
+	rdlq.mu.Lock()
+	defer rdlq.mu.Unlock()
+
+	return rdlq.loadEntries()
+}
+
+func (rdlq *RedisDLQ) GetCount() (int, error) {
+	entries, err := rdlq.GetAll()
+	if err != nil {
+		return 0, err
+	}
+	return len(entries), nil
+}
+
+func (rdlq *RedisDLQ) Clear() error {
+	if !rdlq.enabled || rdlq.client == nil {
+		return nil
+	}
+
+	rdlq.mu.Lock()
+	defer rdlq.mu.Unlock()
+
+	return rdlq.saveEntries([]DLQEntry{})
+}
+
+func (rdlq *RedisDLQ) Replay(limit int) ([]ForwardRequest, error) {
+	if !rdlq.enabled || rdlq.client == nil {
+		return nil, nil
+	}
+
+	rdlq.mu.Lock()
+	defer rdlq.mu.Unlock()
+
+	entries, err := rdlq.loadEntries()
+	if err != nil {
+		return nil, err
+	}
+
+	if limit > 0 && limit < len(entries) {
+		entries = entries[:limit]
+	}
+
+	requests := make([]ForwardRequest, len(entries))
+	for i, entry := range entries {
+		req := entry.Request
+		req.RetryCount = 0
+		req.ReceivedAt = time.Now()
+		requests[i] = req
+	}
+
+	remaining := []DLQEntry{}
+	if limit > 0 && limit < len(entries) {
+		remaining = entries[limit:]
+	}
+	if err := rdlq.saveEntries(remaining); err != nil {
+		return nil, err
+	}
+
+	return requests, nil
+}
+
+func (rdlq *RedisDLQ) loadEntries() ([]DLQEntry, error) {
+	key := rdlq.keyPrefix + ":dlq"
+	data, err := rdlq.client.Get(rdlq.ctx, key).Bytes()
+	if err != nil {
+		if err == redis.Nil {
+			return []DLQEntry{}, nil
+		}
+		return nil, err
+	}
+
+	var entries []DLQEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, err
+	}
+
+	return entries, nil
+}
+
+func (rdlq *RedisDLQ) saveEntries(entries []DLQEntry) error {
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+
+	key := rdlq.keyPrefix + ":dlq"
+	if len(entries) == 0 {
+		return rdlq.client.Del(rdlq.ctx, key).Err()
+	}
+	return rdlq.client.Set(rdlq.ctx, key, data, 0).Err()
 }
 
 type ErrorRecord struct {
@@ -898,7 +1051,7 @@ type CallbackProxy struct {
 	dedupeCache    *DedupeCache
 	circuitBreaker *CircuitBreaker
 	persistence    Persistence
-	dlq            *DeadLetterQueue
+	dlq            DLQ
 }
 
 func NewCallbackProxy(config Config) *CallbackProxy {
@@ -915,12 +1068,25 @@ func NewCallbackProxy(config Config) *CallbackProxy {
 	}
 
 	var persistence Persistence
+	var redisClient *redis.Client
 	if config.RedisAddr != "" {
-		persistence = NewRedisPersistence(config.RedisAddr, config.RedisPassword, config.RedisDB, config.RedisKeyPrefix, config.EnablePersistence)
+		redisPersistence := NewRedisPersistence(config.RedisAddr, config.RedisPassword, config.RedisDB, config.RedisKeyPrefix, config.EnablePersistence)
+		persistence = redisPersistence
+		if redisPersistence.enabled && redisPersistence.client != nil {
+			redisClient = redisPersistence.client
+		}
 	} else {
 		persistence = NewQueuePersistence(config.PersistencePath, config.EnablePersistence)
 	}
-	dlq := NewDeadLetterQueue(config.DLQPath, config.EnableDLQ, config.DLQMaxSize)
+
+	var dlq DLQ
+	if redisClient != nil {
+		dlq = NewRedisDLQ(redisClient, config.RedisKeyPrefix, config.EnableDLQ, config.DLQMaxSize)
+		log.Printf("Using Redis DLQ (prefix: %s)", config.RedisKeyPrefix)
+	} else {
+		dlq = NewDeadLetterQueue(config.DLQPath, config.EnableDLQ, config.DLQMaxSize)
+		log.Printf("Using file-based DLQ (path: %s)", config.DLQPath)
+	}
 
 	retryQueueSize := config.RetryQueueSize
 	if retryQueueSize == 0 {
