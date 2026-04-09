@@ -1280,9 +1280,9 @@ func (cp *CallbackProxy) memoryMonitor() {
 
 func (cp *CallbackProxy) Stop() {
 	close(cp.shutdownCh)
+	cp.wg.Wait()
 	close(cp.queue)
 	close(cp.retryQueue)
-	cp.wg.Wait()
 
 	if rp, ok := cp.persistence.(*RedisPersistence); ok {
 		if err := rp.Close(); err != nil {
@@ -1290,7 +1290,7 @@ func (cp *CallbackProxy) Stop() {
 		}
 	}
 
-	log.Println("All workers stopped")
+	log.Println("Proxy stopped gracefully")
 }
 
 func (cp *CallbackProxy) worker(id int) {
