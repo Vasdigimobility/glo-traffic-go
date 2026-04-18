@@ -1310,7 +1310,9 @@ func (cp *CallbackProxy) worker(id int) {
 	for req := range cp.queue {
 		if !req.ExpiresAt.IsZero() && time.Now().After(req.ExpiresAt) {
 			atomic.AddInt64(&cp.metrics.TotalExpired, 1)
-			log.Printf("Request expired: %s %s (age: %s)", req.Method, req.Path, time.Since(req.ReceivedAt))
+			age := time.Since(req.ReceivedAt)
+			log.Printf("Request expired: %s %s (age: %s) -> DLQ", req.Method, req.Path, age)
+			cp.sendToDLQ(req, fmt.Sprintf("expired (age: %s)", age), "expired", req.RetryCount)
 			continue
 		}
 		cp.processRequest(req, false)
@@ -1326,7 +1328,9 @@ func (cp *CallbackProxy) retryWorker(id int) {
 	for req := range cp.retryQueue {
 		if !req.ExpiresAt.IsZero() && time.Now().After(req.ExpiresAt) {
 			atomic.AddInt64(&cp.metrics.TotalExpired, 1)
-			log.Printf("Retry request expired: %s %s (age: %s)", req.Method, req.Path, time.Since(req.ReceivedAt))
+			age := time.Since(req.ReceivedAt)
+			log.Printf("Retry request expired: %s %s (age: %s) -> DLQ", req.Method, req.Path, age)
+			cp.sendToDLQ(req, fmt.Sprintf("expired (age: %s)", age), "expired", req.RetryCount)
 			continue
 		}
 		cp.processRequest(req, true)
@@ -2112,14 +2116,38 @@ func (cp *CallbackProxy) ReplayDLQ(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now()
 	replayed := 0
 	failed := 0
+	requeued := 0
 	for _, req := range requests {
+		if cp.config.RequestTTL > 0 {
+			req.ExpiresAt = now.Add(cp.config.RequestTTL)
+		} else {
+			req.ExpiresAt = time.Time{}
+		}
+		req.ReceivedAt = now
+		req.RetryCount = 0
+
 		select {
 		case cp.queue <- req:
 			replayed++
 		default:
 			failed++
+			if cp.dlq != nil && cp.config.EnableDLQ {
+				entry := DLQEntry{
+					Request:       req,
+					FailureReason: "replay failed: main queue full",
+					FailureTime:   time.Now(),
+					ErrorType:     "replay_queue_full",
+					AttemptCount:  req.RetryCount,
+				}
+				if dlqErr := cp.dlq.Add(entry); dlqErr == nil {
+					requeued++
+				} else {
+					log.Printf("Failed to requeue to DLQ after full main queue: %v", dlqErr)
+				}
+			}
 		}
 	}
 
@@ -2129,9 +2157,10 @@ func (cp *CallbackProxy) ReplayDLQ(w http.ResponseWriter, r *http.Request) {
 		"status":   "replayed",
 		"replayed": replayed,
 		"failed":   failed,
+		"requeued": requeued,
 		"total":    len(requests),
 	})
-	log.Printf("DLQ replay: %d replayed, %d failed", replayed, failed)
+	log.Printf("DLQ replay: %d replayed, %d failed (%d requeued to DLQ)", replayed, failed, requeued)
 }
 
 func (cp *CallbackProxy) ClearDLQ(w http.ResponseWriter, r *http.Request) {
