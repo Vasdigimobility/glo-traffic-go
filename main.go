@@ -932,7 +932,12 @@ func (m *Metrics) CalculatePercentile(values []int64, percentile float64) int64 
 func (m *Metrics) GetThroughput(window TimeWindow) map[string]float64 {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.getThroughputLocked(window)
+}
 
+// getThroughputLocked computes throughput without acquiring m.mu.
+// The caller MUST already hold m.mu (read or write).
+func (m *Metrics) getThroughputLocked(window TimeWindow) map[string]float64 {
 	if window.StartTime.IsZero() {
 		return map[string]float64{
 			"received_per_sec":  0,
@@ -1019,7 +1024,12 @@ func getStatusIcon(successRate float64, queueUtilization float64) string {
 func (m *Metrics) GetHealthStatus(queueSize, queueCap int) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.getHealthStatusLocked(queueSize, queueCap)
+}
 
+// getHealthStatusLocked computes health status without acquiring m.mu.
+// The caller MUST already hold m.mu (read or write).
+func (m *Metrics) getHealthStatusLocked(queueSize, queueCap int) string {
 	queueUtilization := float64(queueSize) / float64(queueCap)
 	totalReceived := atomic.LoadInt64(&m.TotalReceived)
 	totalFailed := atomic.LoadInt64(&m.TotalFailed)
@@ -1632,7 +1642,7 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	p95 := cp.metrics.CalculatePercentile(cp.metrics.QueueWaitTimes, 0.95)
 	p99 := cp.metrics.CalculatePercentile(cp.metrics.QueueWaitTimes, 0.99)
 
-	throughput1Min := cp.metrics.GetThroughput(cp.metrics.Window1Min)
+	throughput1Min := cp.metrics.getThroughputLocked(cp.metrics.Window1Min)
 	incomingRate := throughput1Min["received_per_sec"]
 	processingRate := throughput1Min["forwarded_per_sec"]
 	lifetimeRate := float64(totalForwarded) / uptime.Seconds()
@@ -1654,7 +1664,7 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 		queueUsage = "NaN%"
 	}
 
-	overallStatus := cp.metrics.GetHealthStatus(queueSize, queueCap)
+	overallStatus := cp.metrics.getHealthStatusLocked(queueSize, queueCap)
 
 	w.Header().Set("Content-Type", "application/json")
 	if overallStatus == "fail" {
@@ -1747,7 +1757,7 @@ func (cp *CallbackProxy) HealthDetailed(w http.ResponseWriter, r *http.Request) 
 
 	queueSize := len(cp.queue)
 	queueCap := cap(cp.queue)
-	status := cp.metrics.GetHealthStatus(queueSize, queueCap)
+	status := cp.metrics.getHealthStatusLocked(queueSize, queueCap)
 	uptime := time.Since(cp.metrics.StartTime)
 	queueUtilization := float64(queueSize) / float64(queueCap)
 
@@ -1811,10 +1821,10 @@ func (cp *CallbackProxy) HealthDetailed(w http.ResponseWriter, r *http.Request) 
 			},
 		},
 		"throughput": map[string]interface{}{
-			"1min":  cp.metrics.GetThroughput(cp.metrics.Window1Min),
-			"5min":  cp.metrics.GetThroughput(cp.metrics.Window5Min),
-			"15min": cp.metrics.GetThroughput(cp.metrics.Window15Min),
-			"1hour": cp.metrics.GetThroughput(cp.metrics.Window1Hour),
+			"1min":  cp.metrics.getThroughputLocked(cp.metrics.Window1Min),
+			"5min":  cp.metrics.getThroughputLocked(cp.metrics.Window5Min),
+			"15min": cp.metrics.getThroughputLocked(cp.metrics.Window15Min),
+			"1hour": cp.metrics.getThroughputLocked(cp.metrics.Window1Hour),
 		},
 		"resources": map[string]interface{}{
 			"goroutines": runtime.NumGoroutine(),
