@@ -1134,6 +1134,7 @@ func NewCallbackProxy(config Config) *CallbackProxy {
 					select {
 					case cp.queue <- req:
 						atomic.AddInt64(&cp.metrics.PersistenceReads, 1)
+						atomic.AddInt64(&cp.metrics.TotalReceived, 1)
 					default:
 						log.Printf("Queue full, cannot restore persisted request")
 						break
@@ -1633,9 +1634,14 @@ func (cp *CallbackProxy) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	totalDropped := atomic.LoadInt64(&cp.metrics.TotalDropped)
 	persistenceWrites := atomic.LoadInt64(&cp.metrics.PersistenceWrites)
 
+	totalExpired := atomic.LoadInt64(&cp.metrics.TotalExpired)
+	completed := totalForwarded + totalFailed + totalDropped + totalExpired
 	var successRate float64
-	if totalReceived > 0 {
-		successRate = float64(totalForwarded) / float64(totalReceived) * 100
+	if completed > 0 {
+		successRate = float64(totalForwarded) / float64(completed) * 100
+		if successRate > 100 {
+			successRate = 100
+		}
 	}
 
 	avgLatency := atomic.LoadInt64(&cp.metrics.AvgForwardMs)
@@ -1770,10 +1776,15 @@ func (cp *CallbackProxy) HealthDetailed(w http.ResponseWriter, r *http.Request) 
 	totalFailed := atomic.LoadInt64(&cp.metrics.TotalFailed)
 	totalDropped := atomic.LoadInt64(&cp.metrics.TotalDropped)
 
+	totalExpired := atomic.LoadInt64(&cp.metrics.TotalExpired)
+	completed := totalForwarded + totalFailed + totalDropped + totalExpired
 	var successRate, errorRate float64
-	if totalReceived > 0 {
-		successRate = float64(totalForwarded) / float64(totalReceived) * 100
-		errorRate = float64(totalFailed) / float64(totalReceived) * 100
+	if completed > 0 {
+		successRate = float64(totalForwarded) / float64(completed) * 100
+		errorRate = float64(totalFailed) / float64(completed) * 100
+		if successRate > 100 {
+			successRate = 100
+		}
 	}
 
 	var m runtime.MemStats
@@ -2132,6 +2143,7 @@ func (cp *CallbackProxy) ReplayDLQ(w http.ResponseWriter, r *http.Request) {
 		select {
 		case cp.queue <- req:
 			replayed++
+			atomic.AddInt64(&cp.metrics.TotalReceived, 1)
 		default:
 			failed++
 			if cp.dlq != nil && cp.config.EnableDLQ {
@@ -2317,7 +2329,10 @@ func main() {
 	mux.HandleFunc("/dlq", proxy.ViewDLQ)
 	mux.HandleFunc("/dlq/replay", proxy.ReplayDLQ)
 	mux.HandleFunc("/dlq/clear", proxy.ClearDLQ)
-	mux.HandleFunc("/", proxy.HandleCallback)
+	mux.HandleFunc("/sync/", proxy.HandleCallback)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
 
 	server := &http.Server{
 		Addr:         config.ListenAddr,
