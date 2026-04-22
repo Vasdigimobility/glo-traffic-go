@@ -39,6 +39,7 @@ type Config struct {
 	RequestTTL              time.Duration
 	EnableDedupe            bool
 	DedupeWindow            time.Duration
+	DedupeCacheMaxSize      int
 	EnablePersistence       bool
 	PersistencePath         string
 	RedisAddr               string
@@ -67,15 +68,17 @@ type ForwardRequest struct {
 }
 
 type DedupeCache struct {
-	seen map[string]time.Time
-	mu   sync.RWMutex
-	ttl  time.Duration
+	seen    map[string]time.Time
+	mu      sync.RWMutex
+	ttl     time.Duration
+	maxSize int
 }
 
-func NewDedupeCache(ttl time.Duration) *DedupeCache {
+func NewDedupeCache(ttl time.Duration, maxSize int) *DedupeCache {
 	return &DedupeCache{
-		seen: make(map[string]time.Time),
-		ttl:  ttl,
+		seen:    make(map[string]time.Time),
+		ttl:     ttl,
+		maxSize: maxSize,
 	}
 }
 
@@ -94,6 +97,19 @@ func (dc *DedupeCache) IsDuplicate(requestID string) bool {
 func (dc *DedupeCache) Add(requestID string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
+
+	if dc.maxSize > 0 && len(dc.seen) >= dc.maxSize {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, t := range dc.seen {
+			if oldestTime.IsZero() || t.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = t
+			}
+		}
+		delete(dc.seen, oldestKey)
+	}
+
 	dc.seen[requestID] = time.Now()
 }
 
@@ -626,21 +642,19 @@ func (rdlq *RedisDLQ) Add(entry DLQEntry) error {
 		return nil
 	}
 
-	rdlq.mu.Lock()
-	defer rdlq.mu.Unlock()
-
-	entries, err := rdlq.loadEntries()
+	data, err := json.Marshal(entry)
 	if err != nil {
-		return fmt.Errorf("failed to load DLQ: %w", err)
+		return fmt.Errorf("failed to marshal DLQ entry: %w", err)
 	}
 
-	entries = append(entries, entry)
-
-	if rdlq.maxSize > 0 && len(entries) > rdlq.maxSize {
-		entries = entries[len(entries)-rdlq.maxSize:]
+	key := rdlq.keyPrefix + ":dlq"
+	pipe := rdlq.client.Pipeline()
+	pipe.LPush(rdlq.ctx, key, data)
+	if rdlq.maxSize > 0 {
+		pipe.LTrim(rdlq.ctx, key, 0, int64(rdlq.maxSize-1))
 	}
-
-	return rdlq.saveEntries(entries)
+	_, err = pipe.Exec(rdlq.ctx)
+	return err
 }
 
 func (rdlq *RedisDLQ) GetAll() ([]DLQEntry, error) {
@@ -648,18 +662,31 @@ func (rdlq *RedisDLQ) GetAll() ([]DLQEntry, error) {
 		return nil, nil
 	}
 
-	rdlq.mu.Lock()
-	defer rdlq.mu.Unlock()
+	key := rdlq.keyPrefix + ":dlq"
+	items, err := rdlq.client.LRange(rdlq.ctx, key, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read DLQ from Redis: %w", err)
+	}
 
-	return rdlq.loadEntries()
+	entries := make([]DLQEntry, 0, len(items))
+	for _, item := range items {
+		var e DLQEntry
+		if err := json.Unmarshal([]byte(item), &e); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
 }
 
 func (rdlq *RedisDLQ) GetCount() (int, error) {
-	entries, err := rdlq.GetAll()
-	if err != nil {
-		return 0, err
+	if !rdlq.enabled || rdlq.client == nil {
+		return 0, nil
 	}
-	return len(entries), nil
+
+	key := rdlq.keyPrefix + ":dlq"
+	n, err := rdlq.client.LLen(rdlq.ctx, key).Result()
+	return int(n), err
 }
 
 func (rdlq *RedisDLQ) Clear() error {
@@ -667,10 +694,8 @@ func (rdlq *RedisDLQ) Clear() error {
 		return nil
 	}
 
-	rdlq.mu.Lock()
-	defer rdlq.mu.Unlock()
-
-	return rdlq.saveEntries([]DLQEntry{})
+	key := rdlq.keyPrefix + ":dlq"
+	return rdlq.client.Del(rdlq.ctx, key).Err()
 }
 
 func (rdlq *RedisDLQ) Replay(limit int) ([]ForwardRequest, error) {
@@ -681,63 +706,42 @@ func (rdlq *RedisDLQ) Replay(limit int) ([]ForwardRequest, error) {
 	rdlq.mu.Lock()
 	defer rdlq.mu.Unlock()
 
-	entries, err := rdlq.loadEntries()
+	key := rdlq.keyPrefix + ":dlq"
+
+	count := int64(limit)
+	if limit <= 0 {
+		var err error
+		count, err = rdlq.client.LLen(rdlq.ctx, key).Result()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get DLQ length: %w", err)
+		}
+	}
+
+	pipe := rdlq.client.Pipeline()
+	rangeCmd := pipe.LRange(rdlq.ctx, key, -count, -1)
+	pipe.LTrim(rdlq.ctx, key, 0, -count-1)
+	if _, err := pipe.Exec(rdlq.ctx); err != nil && err != redis.Nil {
+		return nil, fmt.Errorf("failed to replay DLQ entries: %w", err)
+	}
+
+	items, err := rangeCmd.Result()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read DLQ entries: %w", err)
 	}
 
-	if limit > 0 && limit < len(entries) {
-		entries = entries[:limit]
-	}
-
-	requests := make([]ForwardRequest, len(entries))
-	for i, entry := range entries {
-		req := entry.Request
+	requests := make([]ForwardRequest, 0, len(items))
+	for _, item := range items {
+		var e DLQEntry
+		if err := json.Unmarshal([]byte(item), &e); err != nil {
+			continue
+		}
+		req := e.Request
 		req.RetryCount = 0
 		req.ReceivedAt = time.Now()
-		requests[i] = req
-	}
-
-	remaining := []DLQEntry{}
-	if limit > 0 && limit < len(entries) {
-		remaining = entries[limit:]
-	}
-	if err := rdlq.saveEntries(remaining); err != nil {
-		return nil, err
+		requests = append(requests, req)
 	}
 
 	return requests, nil
-}
-
-func (rdlq *RedisDLQ) loadEntries() ([]DLQEntry, error) {
-	key := rdlq.keyPrefix + ":dlq"
-	data, err := rdlq.client.Get(rdlq.ctx, key).Bytes()
-	if err != nil {
-		if err == redis.Nil {
-			return []DLQEntry{}, nil
-		}
-		return nil, err
-	}
-
-	var entries []DLQEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, err
-	}
-
-	return entries, nil
-}
-
-func (rdlq *RedisDLQ) saveEntries(entries []DLQEntry) error {
-	data, err := json.Marshal(entries)
-	if err != nil {
-		return err
-	}
-
-	key := rdlq.keyPrefix + ":dlq"
-	if len(entries) == 0 {
-		return rdlq.client.Del(rdlq.ctx, key).Err()
-	}
-	return rdlq.client.Set(rdlq.ctx, key, data, 0).Err()
 }
 
 type ErrorRecord struct {
@@ -1051,17 +1055,19 @@ func (m *Metrics) getHealthStatusLocked(queueSize, queueCap int) string {
 }
 
 type CallbackProxy struct {
-	config         Config
-	client         *http.Client
-	queue          chan ForwardRequest
-	retryQueue     chan ForwardRequest
-	wg             sync.WaitGroup
-	shutdownCh     chan struct{}
-	metrics        *Metrics
-	dedupeCache    *DedupeCache
-	circuitBreaker *CircuitBreaker
-	persistence    Persistence
-	dlq            DLQ
+	config          Config
+	client          *http.Client
+	queue           chan ForwardRequest
+	retryQueue      chan ForwardRequest
+	wg              sync.WaitGroup
+	shutdownCh      chan struct{}
+	metrics         *Metrics
+	dedupeCache     *DedupeCache
+	circuitBreaker  *CircuitBreaker
+	persistence     Persistence
+	dlq             DLQ
+	pendingMu       sync.RWMutex
+	pendingRequests map[string]ForwardRequest
 }
 
 func NewCallbackProxy(config Config) *CallbackProxy {
@@ -1069,7 +1075,7 @@ func NewCallbackProxy(config Config) *CallbackProxy {
 
 	var dedupeCache *DedupeCache
 	if config.EnableDedupe {
-		dedupeCache = NewDedupeCache(config.DedupeWindow)
+		dedupeCache = NewDedupeCache(config.DedupeWindow, config.DedupeCacheMaxSize)
 	}
 
 	var circuitBreaker *CircuitBreaker
@@ -1103,18 +1109,26 @@ func NewCallbackProxy(config Config) *CallbackProxy {
 		retryQueueSize = config.QueueSize / 2
 	}
 
+	transport := &http.Transport{
+		MaxIdleConns:        config.WorkerCount + config.RetryWorkerCount + 10,
+		MaxIdleConnsPerHost: config.WorkerCount + config.RetryWorkerCount + 10,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
 	cp := &CallbackProxy{
 		config: config,
 		client: &http.Client{
-			Timeout: config.ForwardTimeout,
+			Timeout:   config.ForwardTimeout,
+			Transport: transport,
 		},
-		queue:          make(chan ForwardRequest, config.QueueSize),
-		retryQueue:     make(chan ForwardRequest, retryQueueSize),
-		shutdownCh:     make(chan struct{}),
-		dedupeCache:    dedupeCache,
-		circuitBreaker: circuitBreaker,
-		persistence:    persistence,
-		dlq:            dlq,
+		queue:           make(chan ForwardRequest, config.QueueSize),
+		retryQueue:      make(chan ForwardRequest, retryQueueSize),
+		shutdownCh:      make(chan struct{}),
+		dedupeCache:     dedupeCache,
+		circuitBreaker:  circuitBreaker,
+		persistence:     persistence,
+		dlq:             dlq,
+		pendingRequests: make(map[string]ForwardRequest),
 		metrics: &Metrics{
 			StartTime:       now,
 			maxRecentErrors: 100,
@@ -1237,29 +1251,22 @@ func (cp *CallbackProxy) persistenceWorker() {
 }
 
 func (cp *CallbackProxy) saveQueue() {
-	queueSize := len(cp.queue)
-	if queueSize == 0 {
+	cp.pendingMu.RLock()
+	if len(cp.pendingRequests) == 0 {
+		cp.pendingMu.RUnlock()
 		return
 	}
-
-	requests := make([]ForwardRequest, 0, queueSize)
-	for i := 0; i < queueSize; i++ {
-		select {
-		case req := <-cp.queue:
-			requests = append(requests, req)
-			cp.queue <- req
-		default:
-			break
-		}
+	requests := make([]ForwardRequest, 0, len(cp.pendingRequests))
+	for _, req := range cp.pendingRequests {
+		requests = append(requests, req)
 	}
+	cp.pendingMu.RUnlock()
 
-	if len(requests) > 0 {
-		if err := cp.persistence.Save(requests); err != nil {
-			log.Printf("Failed to persist queue: %v", err)
-			atomic.AddInt64(&cp.metrics.PersistenceErrors, 1)
-		} else {
-			atomic.AddInt64(&cp.metrics.PersistenceWrites, 1)
-		}
+	if err := cp.persistence.Save(requests); err != nil {
+		log.Printf("Failed to persist queue: %v", err)
+		atomic.AddInt64(&cp.metrics.PersistenceErrors, 1)
+	} else {
+		atomic.AddInt64(&cp.metrics.PersistenceWrites, 1)
 	}
 }
 
@@ -1309,6 +1316,9 @@ func (cp *CallbackProxy) worker(id int) {
 	log.Printf("Worker %d started", id)
 
 	for req := range cp.queue {
+		cp.pendingMu.Lock()
+		delete(cp.pendingRequests, req.RequestID)
+		cp.pendingMu.Unlock()
 		if !req.ExpiresAt.IsZero() && time.Now().After(req.ExpiresAt) {
 			atomic.AddInt64(&cp.metrics.TotalExpired, 1)
 			age := time.Since(req.ReceivedAt)
@@ -1327,6 +1337,9 @@ func (cp *CallbackProxy) retryWorker(id int) {
 	log.Printf("Retry worker %d started", id)
 
 	for req := range cp.retryQueue {
+		cp.pendingMu.Lock()
+		delete(cp.pendingRequests, req.RequestID)
+		cp.pendingMu.Unlock()
 		if !req.ExpiresAt.IsZero() && time.Now().After(req.ExpiresAt) {
 			atomic.AddInt64(&cp.metrics.TotalExpired, 1)
 			age := time.Since(req.ReceivedAt)
@@ -1364,6 +1377,9 @@ func (cp *CallbackProxy) processRequest(fwdReq ForwardRequest, isRetry bool) {
 	if fwdReq.RetryCount <= cp.config.MaxRetries {
 		select {
 		case cp.retryQueue <- fwdReq:
+			cp.pendingMu.Lock()
+			cp.pendingRequests[fwdReq.RequestID] = fwdReq
+			cp.pendingMu.Unlock()
 			log.Printf("Queued for retry (%d/%d): %s %s - %s", fwdReq.RetryCount, cp.config.MaxRetries, fwdReq.Method, fwdReq.Path, err.Error())
 		default:
 			log.Printf("Retry queue full, sending to DLQ: %s %s", fwdReq.Method, fwdReq.Path)
@@ -1568,6 +1584,9 @@ func (cp *CallbackProxy) HandleCallback(w http.ResponseWriter, r *http.Request) 
 
 	select {
 	case cp.queue <- fwdReq:
+		cp.pendingMu.Lock()
+		cp.pendingRequests[fwdReq.RequestID] = fwdReq
+		cp.pendingMu.Unlock()
 		atomic.AddInt64(&cp.metrics.TotalReceived, 1)
 		responseTime := time.Since(requestStart)
 
@@ -2275,6 +2294,7 @@ func main() {
 		RequestTTL:              getEnvDuration("REQUEST_TTL", 5*time.Minute),
 		EnableDedupe:            getEnvBool("ENABLE_DEDUPE", true),
 		DedupeWindow:            getEnvDuration("DEDUPE_WINDOW", 5*time.Minute),
+		DedupeCacheMaxSize:      getEnvInt("DEDUPE_CACHE_MAX_SIZE", 500000),
 		EnablePersistence:       getEnvBool("ENABLE_PERSISTENCE", true),
 		PersistencePath:         getEnv("PERSISTENCE_PATH", "/tmp/glo-traffic-queue.json"),
 		RedisAddr:               getEnv("REDIS_ADDR", "localhost:6379"),
@@ -2306,7 +2326,7 @@ func main() {
 	log.Printf("  Retry Queue Size: %d", config.RetryQueueSize)
 	log.Printf("  Request TTL: %s", config.RequestTTL)
 	log.Printf("  Max Body Size: %d MB", config.MaxBodySize/1024/1024)
-	log.Printf("  Deduplication: %v (window: %s)", config.EnableDedupe, config.DedupeWindow)
+	log.Printf("  Deduplication: %v (window: %s, max_size: %d)", config.EnableDedupe, config.DedupeWindow, config.DedupeCacheMaxSize)
 	if config.RedisAddr != "" {
 		log.Printf("  Persistence: %v (type: Redis, addr: %s, db: %d, prefix: %s)", config.EnablePersistence, config.RedisAddr, config.RedisDB, config.RedisKeyPrefix)
 	} else {
@@ -2314,6 +2334,9 @@ func main() {
 	}
 	log.Printf("  DLQ: %v (path: %s, max size: %d)", config.EnableDLQ, config.DLQPath, config.DLQMaxSize)
 	log.Printf("  Circuit Breaker: %v (threshold: %d, timeout: %s)", config.CircuitBreakerEnabled, config.CircuitBreakerThreshold, config.CircuitBreakerTimeout)
+	if !config.CircuitBreakerEnabled {
+		log.Printf("  WARNING: Circuit breaker is disabled. A downstream outage will block all %d workers for up to %s each.", config.WorkerCount+config.RetryWorkerCount, config.ForwardTimeout)
+	}
 	log.Printf("  Memory Alert Threshold: %d MB", config.MemoryAlertThreshold/1024/1024)
 
 	proxy := NewCallbackProxy(config)
